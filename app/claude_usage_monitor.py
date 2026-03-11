@@ -6,11 +6,15 @@ rumps 기반 독립 실행형 메뉴바 앱. 10분마다 사용량을 자동 갱
 
 import sqlite3
 import os
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 
-import rumps
+try:
+    import rumps
+except ImportError:
+    rumps = None
 
 # ─────────────────────────────────────────────
 # 설정
@@ -170,14 +174,54 @@ def make_progress_bar(ratio, length=20):
 # ─────────────────────────────────────────────
 # macOS Menu Bar App
 # ─────────────────────────────────────────────
-class ClaudeUsageMonitorApp(rumps.App):
+
+# Korean string constants (avoid unicode escapes in f-strings)
+_MENU_REFRESH = "\U0001F504 \uc0c8\ub85c\uace0\uce68 (10\ubd84 \uc790\ub3d9)"
+_LABEL_QUIT = "\uc885\ub8cc"
+_LABEL_PRICING = "\U0001F4B5 \ubaa8\ub378 \uac00\uaca9\ud45c (per 1M tokens)"
+_LABEL_SETTINGS = "\u2699\uFE0F \uc124\uc815"
+_LABEL_OPEN_DB = "\U0001F4C2 DB \ud3f4\ub354 \uc5f4\uae30"
+_LABEL_CHANGE_BUDGET = "\U0001F4B0 \uc6d4 \uc608\uc0b0 \ubcc0\uacbd..."
+_LABEL_INTERVAL = "\u23F1 \uac31\uc2e0 \uc8fc\uae30: 10\ubd84"
+_LABEL_NO_DATA = "\U0001F4ED \uc774\ubc88 \ub2ec \uc0ac\uc6a9 \uae30\ub85d\uc774 \uc5c6\uc2b5\ub2c8\ub2e4."
+_LABEL_MODELS = "\U0001F916 \ubaa8\ub378\ubcc4 \uc0ac\uc6a9\ub7c9"
+
+
+def _noop_decorator(*args, **kwargs):
+    """rumps.timer fallback decorator (no-op) for non-macOS."""
+    def wrapper(func):
+        return func
+    if len(args) == 1 and callable(args[0]):
+        return args[0]
+    return wrapper
+
+
+if rumps is not None:
+    _base_class = rumps.App
+    _timer = rumps.timer
+else:
+    class _base_class:
+        def __init__(self, *args, **kwargs):
+            self.title = ""
+            self.menu = {}
+        def run(self):
+            print("rumps is required for the menu bar app (macOS only).")
+            print("Install with: pip install rumps")
+            sys.exit(1)
+    _timer = _noop_decorator
+
+
+class ClaudeUsageMonitorApp(_base_class):
     def __init__(self):
-        super().__init__(
-            APP_NAME,
-            title="\U0001F4AC $0/0",
-            quit_button=rumps.MenuItem("종료", key="q"),
-        )
-        self._build_menu()
+        if rumps is not None:
+            super().__init__(
+                APP_NAME,
+                title="\U0001F4AC $0/0",
+                quit_button=rumps.MenuItem(_LABEL_QUIT, key="q"),
+            )
+            self._build_menu()
+        else:
+            super().__init__()
         self._refresh_data(None)
 
     def _build_menu(self):
@@ -185,24 +229,23 @@ class ClaudeUsageMonitorApp(rumps.App):
             rumps.MenuItem("summary_header", callback=None),
             rumps.MenuItem("month_cost", callback=None),
             rumps.MenuItem("today_cost", callback=None),
-            None,  # separator
+            None,
             rumps.MenuItem("progress_bar", callback=None),
             None,
             rumps.MenuItem("model_section_header", callback=None),
-            # model details are added dynamically
             None,
             rumps.MenuItem("pricing_menu"),
             None,
             rumps.MenuItem("settings_menu"),
             None,
-            rumps.MenuItem("\U0001F504 새로고침 (10분 자동)", callback=self._refresh_data, key="r"),
+            rumps.MenuItem(_MENU_REFRESH, callback=self._refresh_data, key="r"),
         ]
         self._build_pricing_submenu()
         self._build_settings_submenu()
 
     def _build_pricing_submenu(self):
         pricing_menu = self.menu["pricing_menu"]
-        pricing_menu.title = "\U0001F4B5 모델 가격표 (per 1M tokens)"
+        pricing_menu.title = _LABEL_PRICING
 
         providers = {}
         for model_name, info in sorted(PRICING.items(), key=lambda x: (x[1]["provider"], x[0])):
@@ -222,27 +265,27 @@ class ClaudeUsageMonitorApp(rumps.App):
 
     def _build_settings_submenu(self):
         settings_menu = self.menu["settings_menu"]
-        settings_menu.title = "\u2699\uFE0F 설정"
+        settings_menu.title = _LABEL_SETTINGS
 
         settings_menu.add(rumps.MenuItem(
             f"DB: {DB_PATH}", callback=None
         ))
         settings_menu.add(rumps.MenuItem(
-            "\U0001F4C2 DB 폴더 열기", callback=self._open_db_folder
-        ))
-        settings_menu.add(None)  # separator
-        settings_menu.add(rumps.MenuItem(
-            "\U0001F4B0 월 예산 변경...", callback=self._change_budget
+            _LABEL_OPEN_DB, callback=self._open_db_folder
         ))
         settings_menu.add(None)
         settings_menu.add(rumps.MenuItem(
-            "\u23F1 갱신 주기: 10분", callback=None
+            _LABEL_CHANGE_BUDGET, callback=self._change_budget
+        ))
+        settings_menu.add(None)
+        settings_menu.add(rumps.MenuItem(
+            _LABEL_INTERVAL, callback=None
         ))
 
     # ─────────────────────────────────────────
     # Timer: 10분마다 자동 갱신
     # ─────────────────────────────────────────
-    @rumps.timer(REFRESH_INTERVAL_SEC)
+    @_timer(REFRESH_INTERVAL_SEC)
     def _auto_refresh(self, _):
         self._refresh_data(None)
 
@@ -258,13 +301,19 @@ class ClaudeUsageMonitorApp(rumps.App):
         # 메뉴바 타이틀 업데이트
         self.title = f"\U0001F4AC ${monthly_cost:.0f}/${budget:.0f}"
 
+        if rumps is None:
+            return  # GUI 없는 환경에서는 타이틀만 업데이트
+
         # 요약 섹션
         now = datetime.now()
-        self.menu["summary_header"].title = f"\U0001F4CA {now.strftime('%Y년 %m월')} 사용량"
+        date_str = now.strftime("%Y") + "\ub144 " + now.strftime("%m") + "\uc6d4"
+        self.menu["summary_header"].title = "\U0001F4CA " + date_str + " \uc0ac\uc6a9\ub7c9"
+        month_label = "\uc774\ubc88 \ub2ec"
         self.menu["month_cost"].title = (
-            f"  이번 달: ${monthly_cost:.2f} / ${budget:.2f} ({ratio * 100:.1f}%)"
+            f"  {month_label}: ${monthly_cost:.2f} / ${budget:.2f} ({ratio * 100:.1f}%)"
         )
-        self.menu["today_cost"].title = f"  오늘: ${today_cost:.2f}"
+        today_label = "\uc624\ub298"
+        self.menu["today_cost"].title = f"  {today_label}: ${today_cost:.2f}"
 
         # 프로그레스 바
         bar = make_progress_bar(ratio)
@@ -275,8 +324,9 @@ class ClaudeUsageMonitorApp(rumps.App):
 
         # 마지막 갱신 시각
         refresh_time = now.strftime("%H:%M:%S")
-        self.menu["\U0001F504 새로고침 (10분 자동)"].title = (
-            f"\U0001F504 새로고침 (마지막: {refresh_time})"
+        last_label = "\ub9c8\uc9c0\ub9c9"
+        self.menu[_MENU_REFRESH].title = (
+            f"\U0001F504 \uc0c8\ub85c\uace0\uce68 ({last_label}: {refresh_time})"
         )
 
     def _update_model_details(self, model_details, budget):
@@ -290,10 +340,10 @@ class ClaudeUsageMonitorApp(rumps.App):
             del self.menu[k]
 
         if not model_details:
-            header.title = "\U0001F4ED 이번 달 사용 기록이 없습니다."
+            header.title = _LABEL_NO_DATA
             return
 
-        header.title = "\U0001F916 모델별 사용량"
+        header.title = _LABEL_MODELS
 
         # Provider별 그룹핑
         providers = {}
@@ -302,6 +352,8 @@ class ClaudeUsageMonitorApp(rumps.App):
                 providers[provider] = []
             providers[provider].append((model, input_t, output_t, cost, calls))
 
+        call_label = "\ud638\ucd9c"
+        call_unit = "\ud68c"
         idx = 0
         for provider, models in sorted(providers.items()):
             provider_cost = sum(m[3] for m in models)
@@ -312,7 +364,7 @@ class ClaudeUsageMonitorApp(rumps.App):
             for model, input_t, output_t, cost, calls in models:
                 model_item = rumps.MenuItem(f"    {model}")
                 detail = rumps.MenuItem(
-                    f"      호출: {calls}회 | In: {format_tokens(input_t)} | Out: {format_tokens(output_t)} | ${cost:.4f}"
+                    f"      {call_label}: {calls}{call_unit} | In: {format_tokens(input_t)} | Out: {format_tokens(output_t)} | ${cost:.4f}"
                 )
                 model_item.add(detail)
                 provider_item.add(model_item)
@@ -331,11 +383,11 @@ class ClaudeUsageMonitorApp(rumps.App):
 
     def _change_budget(self, _):
         response = rumps.Window(
-            title="월 예산 변경",
-            message="새 월 예산을 입력하세요 (USD):",
+            title="\uc6d4 \uc608\uc0b0 \ubcc0\uacbd",
+            message="\uc0c8 \uc6d4 \uc608\uc0b0\uc744 \uc785\ub825\ud558\uc138\uc694 (USD):",
             default_text=str(get_monthly_budget()),
-            ok="저장",
-            cancel="취소",
+            ok="\uc800\uc7a5",
+            cancel="\ucde8\uc18c",
             dimensions=(200, 24),
         ).run()
         if response.clicked:
@@ -344,57 +396,59 @@ class ClaudeUsageMonitorApp(rumps.App):
                 if new_budget > 0:
                     set_monthly_budget(new_budget)
                     self._refresh_data(None)
+                    budget_msg = f"\uc6d4 \uc608\uc0b0\uc774 ${new_budget:.2f}\ub85c \ubcc0\uacbd\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
                     rumps.notification(
                         APP_NAME,
-                        "예산 변경 완료",
-                        f"월 예산이 ${new_budget:.2f}로 변경되었습니다.",
+                        "\uc608\uc0b0 \ubcc0\uacbd \uc644\ub8cc",
+                        budget_msg,
                     )
                 else:
-                    rumps.alert("오류", "예산은 0보다 커야 합니다.")
+                    rumps.alert("\uc624\ub958", "\uc608\uc0b0\uc740 0\ubcf4\ub2e4 \ucee4\uc57c \ud569\ub2c8\ub2e4.")
             except ValueError:
-                rumps.alert("오류", "올바른 숫자를 입력해주세요.")
+                rumps.alert("\uc624\ub958", "\uc62c\ubc14\ub978 \uc22b\uc790\ub97c \uc785\ub825\ud574\uc8fc\uc138\uc694.")
+
+
+def _init_db():
+    """DB가 없으면 자동 초기화."""
+    if DB_PATH.exists():
+        return
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    schema_path = Path(__file__).parent.parent / "sql" / "schema.sql"
+    conn = sqlite3.connect(str(DB_PATH))
+    if schema_path.exists():
+        with open(schema_path) as f:
+            conn.executescript(f.read())
+    else:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0.0,
+                session_id TEXT DEFAULT '',
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT OR IGNORE INTO settings (key, value) VALUES
+                ('monthly_budget_usd', '100.00'),
+                ('alert_threshold_percent', '80'),
+                ('currency', 'USD'),
+                ('theme', 'auto');
+            CREATE INDEX IF NOT EXISTS idx_prompts_created_at ON prompts(created_at);
+            CREATE INDEX IF NOT EXISTS idx_prompts_provider ON prompts(provider);
+        """)
+    conn.close()
 
 
 def main():
-    # DB가 없으면 자동 초기화
-    if not DB_PATH.exists():
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        schema_path = Path(__file__).parent.parent / "sql" / "schema.sql"
-        if schema_path.exists():
-            conn = sqlite3.connect(str(DB_PATH))
-            with open(schema_path) as f:
-                conn.executescript(f.read())
-            conn.close()
-        else:
-            # 최소 스키마 직접 생성
-            conn = sqlite3.connect(str(DB_PATH))
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS prompts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    provider TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    input_tokens INTEGER NOT NULL DEFAULT 0,
-                    output_tokens INTEGER NOT NULL DEFAULT 0,
-                    cost_usd REAL NOT NULL DEFAULT 0.0,
-                    session_id TEXT DEFAULT '',
-                    metadata TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                INSERT OR IGNORE INTO settings (key, value) VALUES
-                    ('monthly_budget_usd', '100.00'),
-                    ('alert_threshold_percent', '80'),
-                    ('currency', 'USD'),
-                    ('theme', 'auto');
-                CREATE INDEX IF NOT EXISTS idx_prompts_created_at ON prompts(created_at);
-                CREATE INDEX IF NOT EXISTS idx_prompts_provider ON prompts(provider);
-            """)
-            conn.close()
-
+    _init_db()
     app = ClaudeUsageMonitorApp()
     app.run()
 

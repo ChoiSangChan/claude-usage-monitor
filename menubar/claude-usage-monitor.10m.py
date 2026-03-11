@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <xbar.title>Claude Usage Monitor</xbar.title>
-# <xbar.version>v5.1</xbar.version>
+# <xbar.version>v6.0</xbar.version>
 # <xbar.author>claude-usage-monitor</xbar.author>
 # <xbar.author.github>ChoiSangChan</xbar.author.github>
 # <xbar.desc>Anthropic API 실제 청구액 + Claude Code API 사용 추정치를 메뉴바에 표시합니다.</xbar.desc>
@@ -13,6 +13,8 @@
 #   2) Claude Code API 사용 추정 — 로컬 JSONL 기반 API 비용 추정
 
 import json
+import subprocess
+import sys
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -54,17 +56,22 @@ def get_pricing(model):
     return pricing or {"input": 3.00, "output": 15.00}
 
 
-def color_for(ratio):
-    if ratio < 0.5:
+def save_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+
+
+def color_for_cost(cost):
+    """비용 구간에 따라 색상 반환."""
+    if cost < 50:
         return "#4CAF50"
-    elif ratio < 0.8:
+    elif cost < 150:
         return "#FF9800"
     return "#F44336"
-
-
-def bar(ratio, length=20):
-    filled = int(length * min(ratio, 1.0))
-    return "█" * filled + "░" * (length - filled)
 
 
 def fmt_tokens(n):
@@ -73,6 +80,37 @@ def fmt_tokens(n):
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+def set_admin_api_key():
+    """AppleScript 다이얼로그로 Admin API Key를 입력받아 config.json에 저장."""
+    script = '''
+    tell application "System Events"
+        set userInput to display dialog "Anthropic Admin API Key를 입력하세요:\\n(sk-ant-admin01-...)" \u00ac
+            default answer "" \u00ac
+            with title "Claude Usage Monitor - API Key 설정" \u00ac
+            buttons {"취소", "저장"} default button "저장"
+        if button returned of userInput is "저장" then
+            return text returned of userInput
+        end if
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=60
+        )
+        key = result.stdout.strip()
+        if key and key.startswith("sk-ant-admin"):
+            config = get_config()
+            config["admin_api_key"] = key
+            save_config(config)
+            if CACHE_PATH.exists():
+                CACHE_PATH.unlink()
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def next_month_first():
@@ -237,8 +275,11 @@ def scan_jsonl():
 # ═══════════════════════════════════════════════════
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "set-api-key":
+        set_admin_api_key()
+        return
+
     config = get_config()
-    api_limit = config.get("api_monthly_limit_usd", 200.0)
 
     # ── 자동 조회 ──
     admin_key = config.get("admin_api_key", "")
@@ -251,8 +292,8 @@ def main():
     else:
         title_cost = local_cost
 
-    ratio = title_cost / api_limit if api_limit > 0 else 0
-    print(f"💬 ${title_cost:.2f}/${api_limit:.0f} | color={color_for(ratio)}")
+    c = color_for_cost(title_cost)
+    print(f"💬 ${title_cost:.2f} | color={c}")
     print("---")
 
     now = datetime.now()
@@ -265,11 +306,9 @@ def main():
     print("Anthropic Console 실제 청구액 | size=11 color=#888888")
     if api_data:
         api_cost = api_data["cost_usd"]
-        api_ratio = api_cost / api_limit if api_limit > 0 else 0
-        c = color_for(api_ratio)
+        c = color_for_cost(api_cost)
 
-        print(f"[{bar(api_ratio)}] | font=Menlo size=11 color={c}")
-        print(f"${api_cost:.2f} of ${api_limit:.2f} | size=13 color={c}")
+        print(f"이번 달: ${api_cost:.2f} | size=13 color={c}")
         print(f"Resets on {reset_date} | size=11 color=#888888")
         print(f"---")
 
@@ -279,7 +318,8 @@ def main():
                 pct = (usd / api_cost * 100) if api_cost > 0 else 0
                 print(f"  {name}: ${usd:.2f} ({pct:.0f}%) | size=11 font=Menlo")
     else:
-        print("⚠️ admin_api_key 미설정 — config.json에 추가 필요 | size=11 color=#FF9800")
+        print(f"⚠️ Admin API Key 미설정 | size=11 color=#FF9800")
+        print(f"--🔑 API Key 등록하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
 
     print("---")
 
@@ -287,13 +327,11 @@ def main():
     # ║  Claude Code API 사용 추정 — JSONL 기반 추정치    ║
     # ╚═══════════════════════════════════════════════════╝
     print("💻 Claude Code API 사용 추정 | size=14")
-    print("API Monthly Limit 중 Claude Code 사용분 | size=11 color=#888888")
+    print("로컬 JSONL 기반 API 비용 추정 | size=11 color=#888888")
 
-    local_ratio = local_cost / api_limit if api_limit > 0 else 0
-    c = color_for(local_ratio)
+    c = color_for_cost(local_cost)
 
-    print(f"[{bar(local_ratio)}] | font=Menlo size=11 color={c}")
-    print(f"이번 달: ${local_cost:.2f} (한도 ${api_limit:.0f} 중 {local_ratio * 100:.1f}%) | color={c}")
+    print(f"이번 달: ${local_cost:.2f} | size=13 color={c}")
     print(f"오늘:    ${today_cost:.2f} | size=12")
 
     if api_data:
@@ -321,7 +359,12 @@ def main():
     # ║  설정                                             ║
     # ╚═══════════════════════════════════════════════════╝
     print("⚙️ 설정")
-    print(f"--API Monthly Limit: {'✅ 자동 (Admin API)' if admin_key else '❌ 미연결'} | size=11 color={'#4CAF50' if admin_key else '#F44336'}")
+    if admin_key:
+        print(f"--🔑 Admin API Key: ✅ 연결됨 | size=11 color=#4CAF50")
+        print(f"--🔑 API Key 변경하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
+    else:
+        print(f"--🔑 Admin API Key: ❌ 미설정 | size=11 color=#F44336")
+        print(f"--🔑 API Key 등록하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
     print(f"--Claude Code 추정: ✅ 자동 (JSONL 스캔) | size=11 color=#4CAF50")
     print(f"--캐시 가격 보정: write 1.25x, read 0.1x | size=10 color=#888888")
     print(f"--설정 파일: {CONFIG_PATH} | size=10 color=#888888")

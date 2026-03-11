@@ -193,7 +193,7 @@ def main():
         print("🤖 모델별 사용량 | size=14")
         for model, input_t, output_t, cost, calls in model_details:
             print(f"-- {model} | size=11 font=Menlo")
-            print(f"-- 호출: {calls}회 | In: {format_tokens(input_t)} | Out: {format_tokens(output_t)} | size=11")
+            print(f"-- 호출 {calls}회 · In {format_tokens(input_t)} · Out {format_tokens(output_t)} | size=11")
             print(f"-- 💰 ${cost:.4f} | size=11 color={get_bar_color(cost / budget if budget > 0 else 0)}")
     else:
         print("📭 사용 기록 없음")

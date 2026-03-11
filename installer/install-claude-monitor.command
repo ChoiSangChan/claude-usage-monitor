@@ -27,7 +27,7 @@ INSTALL_DIR="$HOME/claude-usage-monitor"
 DB_DIR="$HOME/.claude-usage-monitor"
 DB_PATH="$DB_DIR/usage.db"
 XBAR_PLUGIN_DIR="$HOME/Library/Application Support/xbar/plugins"
-STARTUP_SCRIPT="$DB_DIR/pythonstartup.py"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
 clear
 echo ""
@@ -35,17 +35,16 @@ echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║                                                      ║"
 echo "  ║   💬 Claude Usage Monitor                            ║"
-echo "  ║   원클릭 설치 프로그램                                  ║"
+echo "  ║   원클릭 설치 프로그램 v2.0                            ║"
 echo "  ║                                                      ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo ""
 echo -e "  이 프로그램은 다음을 자동으로 설치합니다:"
 echo ""
-echo -e "    ${GREEN}✦${NC} LLM API 사용량 자동 추적 (Anthropic, OpenAI)"
+echo -e "    ${GREEN}✦${NC} Claude Code Stop Hook (자동 사용량 추적)"
 echo -e "    ${GREEN}✦${NC} macOS 메뉴바에 사용량 & 예산 실시간 표시"
 echo -e "    ${GREEN}✦${NC} 10분마다 자동 갱신"
-echo -e "    ${GREEN}✦${NC} 35개+ AI 모델 지원"
 echo ""
 echo -e "  ${YELLOW}설치를 시작하려면 Enter를 누르세요. (취소: Ctrl+C)${NC}"
 read -r
@@ -146,7 +145,6 @@ mkdir -p "$DB_DIR"
 
 if [ -f "$DB_PATH" ]; then
     echo -e "${GREEN}  ✔ 기존 데이터베이스 유지: $DB_PATH${NC}"
-    # 스키마 업데이트 (기존 데이터 보존)
     sqlite3 "$DB_PATH" < "$INSTALL_DIR/sql/schema.sql" 2>/dev/null || true
 else
     sqlite3 "$DB_PATH" < "$INSTALL_DIR/sql/schema.sql"
@@ -154,131 +152,82 @@ else
 fi
 
 # ─────────────────────────────────────────────────────
-# Step 5: API 자동 추적 Hook 설정
+# Step 5: Claude Code Hook 설정
 # ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [5/6] API 자동 추적 설정${NC}"
+echo -e "${CYAN}  [5/6] Claude Code Hook 설정${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-# PYTHONSTARTUP Hook 생성
-cat > "$STARTUP_SCRIPT" << 'PYEOF'
-"""
-Claude Usage Monitor - PYTHONSTARTUP Hook
-Anthropic/OpenAI API 호출을 자동으로 캡처합니다.
-"""
-import importlib
-import sys
+chmod +x "$INSTALL_DIR/scripts/claude-code-hook.py"
 
-def _install_usage_hooks():
-    import json
-    import sqlite3
-    from pathlib import Path
-    from functools import wraps
+# Claude Code settings.json에 Stop hook 추가
+mkdir -p "$HOME/.claude"
 
-    DB_PATH = Path.home() / ".claude-usage-monitor" / "usage.db"
-    if not DB_PATH.exists():
-        return
+if [ -f "$CLAUDE_SETTINGS" ]; then
+    # 기존 설정 파일이 있으면 hook 추가
+    if python3 -c "
+import json, sys
 
-    def _record(provider, model, input_tokens, output_tokens, cost):
-        try:
-            conn = sqlite3.connect(str(DB_PATH))
-            conn.execute(
-                "INSERT INTO prompts (provider, model, input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)",
-                (provider, model, input_tokens, output_tokens, cost),
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+with open('$CLAUDE_SETTINGS') as f:
+    settings = json.load(f)
 
-    # Anthropic Hook
-    try:
-        import anthropic
-        _orig_create = anthropic.resources.messages.Messages.create
+hooks = settings.setdefault('hooks', {})
+stop_hooks = hooks.setdefault('Stop', [])
 
-        @wraps(_orig_create)
-        def _hooked_anthropic_create(self, *args, **kwargs):
-            response = _orig_create(self, *args, **kwargs)
-            try:
-                usage = response.usage
-                model = response.model
-                input_t = usage.input_tokens
-                output_t = usage.output_tokens
-                PRICES = {
-                    "claude-opus-4-6": (15.0, 75.0),
-                    "claude-sonnet-4-6": (3.0, 15.0),
-                    "claude-haiku-4-5-20251001": (0.80, 4.0),
-                }
-                price = PRICES.get(model, (3.0, 15.0))
-                cost = (input_t / 1e6) * price[0] + (output_t / 1e6) * price[1]
-                _record("anthropic", model, input_t, output_t, round(cost, 6))
-            except Exception:
-                pass
-            return response
+# 이미 claude-usage-monitor hook이 있는지 확인
+hook_cmd = 'python3 $INSTALL_DIR/scripts/claude-code-hook.py'
+already_exists = False
+for entry in stop_hooks:
+    for h in entry.get('hooks', []):
+        if 'claude-code-hook' in h.get('command', ''):
+            already_exists = True
+            break
 
-        anthropic.resources.messages.Messages.create = _hooked_anthropic_create
-    except (ImportError, AttributeError):
-        pass
+if not already_exists:
+    stop_hooks.append({
+        'matcher': '',
+        'hooks': [{
+            'type': 'command',
+            'command': hook_cmd
+        }]
+    })
 
-    # OpenAI Hook
-    try:
-        import openai
-        _orig_openai_create = openai.resources.chat.completions.Completions.create
+with open('$CLAUDE_SETTINGS', 'w') as f:
+    json.dump(settings, f, indent=4)
 
-        @wraps(_orig_openai_create)
-        def _hooked_openai_create(self, *args, **kwargs):
-            response = _orig_openai_create(self, *args, **kwargs)
-            try:
-                usage = response.usage
-                model = response.model
-                input_t = usage.prompt_tokens
-                output_t = usage.completion_tokens
-                PRICES = {
-                    "gpt-4o": (2.50, 10.0),
-                    "gpt-4o-mini": (0.15, 0.60),
-                    "gpt-4-turbo": (10.0, 30.0),
-                }
-                price = PRICES.get(model, (2.50, 10.0))
-                cost = (input_t / 1e6) * price[0] + (output_t / 1e6) * price[1]
-                _record("openai", model, input_t, output_t, round(cost, 6))
-            except Exception:
-                pass
-            return response
-
-        openai.resources.chat.completions.Completions.create = _hooked_openai_create
-    except (ImportError, AttributeError):
-        pass
-
-try:
-    _install_usage_hooks()
-except Exception:
-    pass
-PYEOF
-
-echo -e "${GREEN}  ✔ API 추적 Hook 생성 완료${NC}"
-
-# 쉘 프로파일에 PYTHONSTARTUP 추가
-SHELL_RC=""
-if [ -f "$HOME/.zshrc" ]; then
-    SHELL_RC="$HOME/.zshrc"
-elif [ -f "$HOME/.bashrc" ]; then
-    SHELL_RC="$HOME/.bashrc"
-elif [ -f "$HOME/.bash_profile" ]; then
-    SHELL_RC="$HOME/.bash_profile"
-fi
-
-if [ -n "$SHELL_RC" ]; then
-    EXPORT_LINE="export PYTHONSTARTUP=\"$STARTUP_SCRIPT\""
-    if grep -q "claude-usage-monitor" "$SHELL_RC" 2>/dev/null; then
-        echo -e "${GREEN}  ✔ PYTHONSTARTUP 이미 설정됨${NC}"
+if already_exists:
+    print('EXISTS')
+else:
+    print('ADDED')
+" 2>/dev/null; then
+        echo -e "${GREEN}  ✔ Claude Code Stop Hook 설정 완료${NC}"
     else
-        echo "" >> "$SHELL_RC"
-        echo "# Claude Usage Monitor - API 사용량 자동 추적" >> "$SHELL_RC"
-        echo "$EXPORT_LINE" >> "$SHELL_RC"
-        echo -e "${GREEN}  ✔ PYTHONSTARTUP 설정 완료 ($SHELL_RC)${NC}"
+        echo -e "${YELLOW}  ⚠ 설정 파일 수정 실패. 수동으로 추가해주세요.${NC}"
     fi
+else
+    # 새로 생성
+    cat > "$CLAUDE_SETTINGS" << JSONEOF
+{
+    "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 $INSTALL_DIR/scripts/claude-code-hook.py"
+                    }
+                ]
+            }
+        ]
+    }
+}
+JSONEOF
+    echo -e "${GREEN}  ✔ Claude Code Hook 설정 생성 완료${NC}"
 fi
+
+echo -e "     Claude Code 세션이 끝날 때마다 자동으로 사용량이 기록됩니다."
 
 # ─────────────────────────────────────────────────────
 # Step 6: xbar 메뉴바 플러그인
@@ -289,11 +238,14 @@ echo -e "${CYAN}  [6/6] 메뉴바 플러그인 설정${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 MENUBAR_SRC="$INSTALL_DIR/menubar/claude-usage-monitor.10m.py"
+chmod +x "$MENUBAR_SRC"
 
 if [ -d "$XBAR_PLUGIN_DIR" ]; then
+    # 기존 중복 플러그인 제거
+    rm -f "$XBAR_PLUGIN_DIR/claude-usage-monitor.5m.py" 2>/dev/null
     cp "$MENUBAR_SRC" "$XBAR_PLUGIN_DIR/"
     chmod +x "$XBAR_PLUGIN_DIR/claude-usage-monitor.10m.py"
-    echo -e "${GREEN}  ✔ xbar 플러그인 설치 완료${NC}"
+    echo -e "${GREEN}  ✔ xbar 플러그인 설치 완료 (하나만 표시됨)${NC}"
     echo -e "     10분마다 자동으로 사용량이 갱신됩니다."
 else
     echo -e "${YELLOW}  ⚠ xbar가 아직 설치되지 않았습니다.${NC}"
@@ -303,10 +255,6 @@ else
     echo ""
     echo -e "  설치 후 이 파일을 다시 실행하면 자동으로 플러그인이 설치됩니다."
 fi
-
-# 실행 권한
-chmod +x "$INSTALL_DIR/scripts/hook.py" 2>/dev/null
-chmod +x "$MENUBAR_SRC" 2>/dev/null
 
 # ─────────────────────────────────────────────────────
 # 완료!
@@ -324,15 +272,15 @@ echo ""
 echo -e "  ${BOLD}설치 정보:${NC}"
 echo -e "    📂 프로젝트:    $INSTALL_DIR"
 echo -e "    💾 데이터베이스: $DB_PATH"
-echo -e "    🔗 Hook:       $STARTUP_SCRIPT"
+echo -e "    🔗 Hook:       Claude Code Stop Hook (자동 설정됨)"
 echo ""
-echo -e "  ${BOLD}다음 할 일:${NC}"
-echo -e "    ${CYAN}1.${NC} 터미널을 닫고 다시 열어주세요 (또는 source $SHELL_RC)"
-echo -e "    ${CYAN}2.${NC} xbar 앱을 실행해주세요 (Applications > xbar)"
-echo -e "    ${CYAN}3.${NC} 이제 Python에서 API 호출하면 자동으로 추적됩니다!"
+echo -e "  ${BOLD}작동 방식:${NC}"
+echo -e "    ${CYAN}1.${NC} Claude Code를 사용하면 세션 종료 시 자동으로 토큰 사용량 기록"
+echo -e "    ${CYAN}2.${NC} xbar 메뉴바에서 실시간 비용 확인 (💬 \$0.00/200)"
+echo -e "    ${CYAN}3.${NC} 10분마다 자동 갱신"
 echo ""
-echo -e "  ${BOLD}테스트:${NC}"
-echo -e "    python3 $INSTALL_DIR/examples/test_api.py"
+echo -e "  ${BOLD}참고:${NC}"
+echo -e "    xbar가 이미 실행 중이면 메뉴바의 xbar 아이콘 > Refresh All을 클릭하세요."
 echo ""
 echo -e "  ${YELLOW}아무 키나 누르면 이 창이 닫힙니다.${NC}"
 read -n 1

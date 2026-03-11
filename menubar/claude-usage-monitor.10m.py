@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # <xbar.title>Claude Usage Monitor</xbar.title>
-# <xbar.version>v2.0</xbar.version>
+# <xbar.version>v3.0</xbar.version>
 # <xbar.author>claude-usage-monitor</xbar.author>
 # <xbar.author.github>ChoiSangChan</xbar.author.github>
-# <xbar.desc>Claude API 사용량을 메뉴바에 표시합니다.</xbar.desc>
-# <xbar.dependencies>python3,sqlite3</xbar.dependencies>
+# <xbar.desc>Claude Code 사용량을 JSONL transcript에서 직접 읽어 메뉴바에 표시합니다.</xbar.desc>
+# <xbar.dependencies>python3</xbar.dependencies>
 #
 # 10분마다 갱신 (파일명의 .10m.)
 
-import sqlite3
+import json
+import os
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path.home() / ".claude-usage-monitor" / "usage.db"
+CLAUDE_DIR = Path.home() / ".claude" / "projects"
+CONFIG_PATH = Path.home() / ".claude-usage-monitor" / "config.json"
 
-# Anthropic 모델 가격표 (USD per 1M tokens)
+# Anthropic 가격표 (USD per 1M tokens)
 PRICING = {
     "claude-opus-4-6":              {"input": 15.00,  "output": 75.00},
     "claude-sonnet-4-6":            {"input": 3.00,   "output": 15.00},
@@ -27,67 +29,120 @@ PRICING = {
 }
 
 
-def get_db():
-    if not DB_PATH.exists():
-        return None
-    return sqlite3.connect(str(DB_PATH))
+def get_config():
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"monthly_budget_usd": 100.0}
 
 
-def get_monthly_usage():
-    conn = get_db()
-    if not conn:
-        return 0.0, []
+def get_pricing(model):
+    pricing = PRICING.get(model)
+    if not pricing:
+        for known_model, p in PRICING.items():
+            if model.startswith(known_model.rsplit("-", 1)[0]):
+                pricing = p
+                break
+    return pricing or {"input": 3.00, "output": 15.00}
 
+
+def scan_jsonl_files():
+    """~/.claude/projects/ 아래의 모든 JSONL 파일에서 이번 달 사용량을 집계."""
     now = datetime.now()
-    month_start = now.strftime("%Y-%m-01")
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    cursor = conn.execute(
-        "SELECT COALESCE(SUM(cost_usd), 0) FROM prompts WHERE created_at >= ?",
-        (month_start,),
-    )
-    total_cost = cursor.fetchone()[0]
+    # 모델별 집계: {model: {input_tokens, output_tokens, cost, calls}}
+    models = {}
+    today_cost = 0.0
+    total_cost = 0.0
 
-    cursor = conn.execute(
-        """
-        SELECT model,
-               SUM(input_tokens) as input_tokens,
-               SUM(output_tokens) as output_tokens,
-               SUM(cost_usd) as cost,
-               COUNT(*) as calls
-        FROM prompts
-        WHERE created_at >= ?
-        GROUP BY model
-        ORDER BY cost DESC
-        """,
-        (month_start,),
-    )
-    model_details = cursor.fetchall()
-    conn.close()
-    return total_cost, model_details
+    if not CLAUDE_DIR.exists():
+        return total_cost, today_cost, []
 
+    # 이번 달에 수정된 JSONL 파일만 스캔 (성능 최적화)
+    month_start_ts = month_start.timestamp()
 
-def get_today_usage():
-    conn = get_db()
-    if not conn:
-        return 0.0
-    cursor = conn.execute(
-        "SELECT COALESCE(SUM(cost_usd), 0) FROM prompts WHERE date(created_at) = date('now')"
-    )
-    cost = cursor.fetchone()[0]
-    conn.close()
-    return cost
+    for jsonl_path in CLAUDE_DIR.rglob("*.jsonl"):
+        # 파일 수정 시간이 이번 달 이전이면 스킵
+        try:
+            if jsonl_path.stat().st_mtime < month_start_ts:
+                continue
+        except OSError:
+            continue
 
+        try:
+            with open(jsonl_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or '"usage"' not in line:
+                        continue
 
-def get_monthly_budget():
-    conn = get_db()
-    if not conn:
-        return 200.0
-    cursor = conn.execute(
-        "SELECT value FROM settings WHERE key = 'monthly_budget_usd'"
-    )
-    row = cursor.fetchone()
-    conn.close()
-    return float(row[0]) if row else 200.0
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg = data.get("message", {})
+                    if msg.get("role") != "assistant":
+                        continue
+
+                    usage = msg.get("usage")
+                    if not usage:
+                        continue
+
+                    # 타임스탬프 확인 (이번 달 데이터만)
+                    ts_str = data.get("timestamp", "")
+                    if not ts_str:
+                        continue
+
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        ts_local = ts.replace(tzinfo=None)  # 로컬 시간으로 비교
+                    except (ValueError, AttributeError):
+                        continue
+
+                    if ts_local < month_start:
+                        continue
+
+                    model = msg.get("model", "unknown")
+                    input_t = usage.get("input_tokens", 0)
+                    cache_create = usage.get("cache_creation_input_tokens", 0)
+                    cache_read = usage.get("cache_read_input_tokens", 0)
+                    output_t = usage.get("output_tokens", 0)
+
+                    effective_input = input_t + cache_create + cache_read
+
+                    pricing = get_pricing(model)
+                    cost = (effective_input / 1_000_000) * pricing["input"] + \
+                           (output_t / 1_000_000) * pricing["output"]
+
+                    # 모델별 집계
+                    if model not in models:
+                        models[model] = {"input": 0, "output": 0, "cost": 0.0, "calls": 0}
+                    models[model]["input"] += effective_input
+                    models[model]["output"] += output_t
+                    models[model]["cost"] += cost
+                    models[model]["calls"] += 1
+
+                    total_cost += cost
+
+                    if ts_local >= today_start:
+                        today_cost += cost
+
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    # 모델별 상세 리스트 (비용 내림차순)
+    model_details = [
+        (model, d["input"], d["output"], d["cost"], d["calls"])
+        for model, d in sorted(models.items(), key=lambda x: x[1]["cost"], reverse=True)
+    ]
+
+    return total_cost, today_cost, model_details
 
 
 def format_tokens(n):
@@ -108,9 +163,10 @@ def get_bar_color(ratio):
 
 
 def main():
-    monthly_cost, model_details = get_monthly_usage()
-    today_cost = get_today_usage()
-    budget = get_monthly_budget()
+    config = get_config()
+    budget = config.get("monthly_budget_usd", 100.0)
+
+    monthly_cost, today_cost, model_details = scan_jsonl_files()
     ratio = monthly_cost / budget if budget > 0 else 0
     color = get_bar_color(ratio)
 
@@ -140,13 +196,14 @@ def main():
             print(f"-- 호출: {calls}회 | In: {format_tokens(input_t)} | Out: {format_tokens(output_t)} | size=11")
             print(f"-- 💰 ${cost:.4f} | size=11 color={get_bar_color(cost / budget if budget > 0 else 0)}")
     else:
-        print("📭 사용 기록 없음 - Claude Code hook이 설정되었는지 확인하세요")
+        print("📭 사용 기록 없음")
+        print("-- ~/.claude/projects/ 에 JSONL 파일이 없습니다 | size=11")
 
     print("---")
     print("⚙️ 설정")
-    print(f"--DB 경로: {DB_PATH} | size=11 color=#888888")
+    print(f"--데이터 소스: ~/.claude/projects/ | size=11 color=#888888")
     print(f"--월 예산: ${budget:.2f} | size=11")
-    print("--DB 폴더 열기 | bash=open param1={} terminal=false".format(str(DB_PATH.parent)))
+    print(f"--설정 파일: {CONFIG_PATH} | size=11 color=#888888")
     print("---")
     print("🔄 새로고침 | refresh=true")
 

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 # <xbar.title>Claude Usage Monitor</xbar.title>
-# <xbar.version>v3.0</xbar.version>
+# <xbar.version>v6.0</xbar.version>
 # <xbar.author>claude-usage-monitor</xbar.author>
 # <xbar.author.github>ChoiSangChan</xbar.author.github>
-# <xbar.desc>Claude Code 사용량을 JSONL transcript에서 직접 읽어 메뉴바에 표시합니다.</xbar.desc>
+# <xbar.desc>Anthropic API 실제 청구액 + Claude Code API 사용 추정치를 메뉴바에 표시합니다.</xbar.desc>
 # <xbar.dependencies>python3</xbar.dependencies>
 #
 # 10분마다 갱신 (파일명의 .10m.)
+#
+# 자동 조회 데이터:
+#   1) API Monthly Limit  — Anthropic Admin API 실제 청구액
+#   2) Claude Code API 사용 추정 — 로컬 JSONL 기반 API 비용 추정
 
 import json
-import os
-from datetime import datetime
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 CONFIG_PATH = Path.home() / ".claude-usage-monitor" / "config.json"
+CACHE_PATH = Path.home() / ".claude-usage-monitor" / "api_cache.json"
 
-# Anthropic 가격표 (USD per 1M tokens)
 PRICING = {
     "claude-opus-4-6":              {"input": 15.00,  "output": 75.00},
     "claude-sonnet-4-6":            {"input": 3.00,   "output": 15.00},
@@ -36,7 +43,7 @@ def get_config():
                 return json.load(f)
         except Exception:
             pass
-    return {"monthly_budget_usd": 100.0}
+    return {}
 
 
 def get_pricing(model):
@@ -49,13 +56,143 @@ def get_pricing(model):
     return pricing or {"input": 3.00, "output": 15.00}
 
 
-def scan_jsonl_files():
-    """~/.claude/projects/ 아래의 모든 JSONL 파일에서 이번 달 사용량을 집계."""
+def save_config(config):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+
+
+def color_for_cost(cost):
+    """비용 구간에 따라 색상 반환."""
+    if cost < 50:
+        return "#4CAF50"
+    elif cost < 150:
+        return "#FF9800"
+    return "#F44336"
+
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def set_admin_api_key():
+    """AppleScript 다이얼로그로 Admin API Key를 입력받아 config.json에 저장."""
+    script = '''
+    tell application "System Events"
+        set userInput to display dialog "Anthropic Admin API Key를 입력하세요:\\n(sk-ant-admin01-...)" \u00ac
+            default answer "" \u00ac
+            with title "Claude Usage Monitor - API Key 설정" \u00ac
+            buttons {"취소", "저장"} default button "저장"
+        if button returned of userInput is "저장" then
+            return text returned of userInput
+        end if
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=60
+        )
+        key = result.stdout.strip()
+        if key and key.startswith("sk-ant-admin"):
+            config = get_config()
+            config["admin_api_key"] = key
+            save_config(config)
+            if CACHE_PATH.exists():
+                CACHE_PATH.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def next_month_first():
+    now = datetime.now()
+    if now.month < 12:
+        return now.replace(month=now.month + 1, day=1)
+    return now.replace(year=now.year + 1, month=1, day=1)
+
+
+# ═══════════════════════════════════════════════════
+# Admin API — Anthropic 실제 청구액 자동 조회
+# ═══════════════════════════════════════════════════
+
+def fetch_admin_api(admin_key):
+    """Admin API cost_report 조회 (5분 캐시)."""
+    if CACHE_PATH.exists():
+        try:
+            with open(CACHE_PATH) as f:
+                cache = json.load(f)
+            cached_at = datetime.fromisoformat(cache["cached_at"])
+            if (datetime.now() - cached_at).total_seconds() < 300:
+                return cache["data"]
+        except Exception:
+            pass
+
+    now = datetime.utcnow()
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = now + timedelta(days=1)
+
+    url = (
+        f"https://api.anthropic.com/v1/organizations/cost_report?"
+        f"starting_at={start.strftime('%Y-%m-%dT00:00:00Z')}&"
+        f"ending_at={end.strftime('%Y-%m-%dT00:00:00Z')}&"
+        f"bucket_width=1d&"
+        f"group_by[]=description"
+    )
+    req = urllib.request.Request(url, headers={
+        "anthropic-version": "2023-06-01",
+        "x-api-key": admin_key,
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+    total_cents = 0
+    by_model = {}
+    for bucket in raw.get("data", []):
+        for item in bucket.get("costs", []):
+            amt = float(item.get("amount", "0"))
+            total_cents += amt
+            parsed = item.get("parsed_description", {})
+            name = parsed.get("model", item.get("description", "unknown"))
+            by_model[name] = by_model.get(name, 0) + amt
+
+    result = {
+        "cost_usd": total_cents / 100.0,
+        "models": {k: v / 100.0 for k, v in by_model.items()},
+    }
+
+    try:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_PATH, "w") as f:
+            json.dump({"cached_at": datetime.now().isoformat(), "data": result}, f)
+    except Exception:
+        pass
+
+    return result
+
+
+# ═══════════════════════════════════════════════════
+# JSONL 스캔 — Claude Code API 사용량 추정
+# ═══════════════════════════════════════════════════
+
+def scan_jsonl():
     now = datetime.now()
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_ts = month_start.timestamp()
 
-    # 모델별 집계: {model: {input_tokens, output_tokens, cost, calls}}
     models = {}
     today_cost = 0.0
     total_cost = 0.0
@@ -63,24 +200,19 @@ def scan_jsonl_files():
     if not CLAUDE_DIR.exists():
         return total_cost, today_cost, []
 
-    # 이번 달에 수정된 JSONL 파일만 스캔 (성능 최적화)
-    month_start_ts = month_start.timestamp()
-
-    for jsonl_path in CLAUDE_DIR.rglob("*.jsonl"):
-        # 파일 수정 시간이 이번 달 이전이면 스킵
+    for path in CLAUDE_DIR.rglob("*.jsonl"):
         try:
-            if jsonl_path.stat().st_mtime < month_start_ts:
+            if path.stat().st_mtime < month_ts:
                 continue
         except OSError:
             continue
 
         try:
-            with open(jsonl_path) as f:
+            with open(path) as f:
                 for line in f:
                     line = line.strip()
                     if not line or '"usage"' not in line:
                         continue
-
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
@@ -89,123 +221,156 @@ def scan_jsonl_files():
                     msg = data.get("message", {})
                     if msg.get("role") != "assistant":
                         continue
-
                     usage = msg.get("usage")
                     if not usage:
                         continue
 
-                    # 타임스탬프 확인 (이번 달 데이터만)
                     ts_str = data.get("timestamp", "")
                     if not ts_str:
                         continue
-
                     try:
                         ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        ts_local = ts.replace(tzinfo=None)  # 로컬 시간으로 비교
+                        ts_local = ts.replace(tzinfo=None)
                     except (ValueError, AttributeError):
                         continue
-
                     if ts_local < month_start:
                         continue
 
                     model = msg.get("model", "unknown")
-                    input_t = usage.get("input_tokens", 0)
-                    cache_create = usage.get("cache_creation_input_tokens", 0)
-                    cache_read = usage.get("cache_read_input_tokens", 0)
-                    output_t = usage.get("output_tokens", 0)
+                    inp = usage.get("input_tokens", 0)
+                    cw = usage.get("cache_creation_input_tokens", 0)
+                    cr = usage.get("cache_read_input_tokens", 0)
+                    out = usage.get("output_tokens", 0)
 
-                    effective_input = input_t + cache_create + cache_read
+                    p = get_pricing(model)
+                    cost = (inp / 1e6) * p["input"] + \
+                           (cw / 1e6) * p["input"] * 1.25 + \
+                           (cr / 1e6) * p["input"] * 0.1 + \
+                           (out / 1e6) * p["output"]
 
-                    pricing = get_pricing(model)
-                    cost = (effective_input / 1_000_000) * pricing["input"] + \
-                           (output_t / 1_000_000) * pricing["output"]
-
-                    # 모델별 집계
+                    eff_in = inp + cw + cr
                     if model not in models:
-                        models[model] = {"input": 0, "output": 0, "cost": 0.0, "calls": 0}
-                    models[model]["input"] += effective_input
-                    models[model]["output"] += output_t
+                        models[model] = {"in": 0, "out": 0, "cost": 0.0, "calls": 0}
+                    models[model]["in"] += eff_in
+                    models[model]["out"] += out
                     models[model]["cost"] += cost
                     models[model]["calls"] += 1
 
                     total_cost += cost
-
                     if ts_local >= today_start:
                         today_cost += cost
 
         except (OSError, UnicodeDecodeError):
             continue
 
-    # 모델별 상세 리스트 (비용 내림차순)
-    model_details = [
-        (model, d["input"], d["output"], d["cost"], d["calls"])
-        for model, d in sorted(models.items(), key=lambda x: x[1]["cost"], reverse=True)
+    details = [
+        (m, d["in"], d["out"], d["cost"], d["calls"])
+        for m, d in sorted(models.items(), key=lambda x: x[1]["cost"], reverse=True)
     ]
-
-    return total_cost, today_cost, model_details
-
-
-def format_tokens(n):
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+    return total_cost, today_cost, details
 
 
-def get_bar_color(ratio):
-    if ratio < 0.5:
-        return "#4CAF50"
-    elif ratio < 0.8:
-        return "#FF9800"
-    else:
-        return "#F44336"
-
+# ═══════════════════════════════════════════════════
+# 메뉴바 출력
+# ═══════════════════════════════════════════════════
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "set-api-key":
+        set_admin_api_key()
+        return
+
     config = get_config()
-    budget = config.get("monthly_budget_usd", 100.0)
 
-    monthly_cost, today_cost, model_details = scan_jsonl_files()
-    ratio = monthly_cost / budget if budget > 0 else 0
-    color = get_bar_color(ratio)
+    # ── 자동 조회 ──
+    admin_key = config.get("admin_api_key", "")
+    api_data = fetch_admin_api(admin_key) if admin_key else None
+    local_cost, today_cost, model_details = scan_jsonl()
 
-    # 메뉴바 타이틀
-    print(f"💬 ${monthly_cost:.2f}/${budget:.0f} | color={color}")
-    print("---")
-
-    # 요약
-    now = datetime.now()
-    print(f"📊 {now.strftime('%Y년 %m월')} Claude 사용량 | size=14")
-    print(f"이번 달: ${monthly_cost:.2f} / ${budget:.2f} ({ratio * 100:.1f}%) | color={color}")
-    print(f"오늘: ${today_cost:.2f}")
-    print("---")
-
-    # 프로그레스 바
-    bar_length = 20
-    filled = int(bar_length * min(ratio, 1.0))
-    bar = "█" * filled + "░" * (bar_length - filled)
-    print(f"[{bar}] {ratio * 100:.1f}% | font=Menlo size=12")
-    print("---")
-
-    # 모델별 상세
-    if model_details:
-        print("🤖 모델별 사용량 | size=14")
-        for model, input_t, output_t, cost, calls in model_details:
-            print(f"-- {model} | size=11 font=Menlo")
-            print(f"-- 호출 {calls}회 · In {format_tokens(input_t)} · Out {format_tokens(output_t)} | size=11")
-            print(f"-- 💰 ${cost:.4f} | size=11 color={get_bar_color(cost / budget if budget > 0 else 0)}")
+    # ── 메뉴바 타이틀 ──
+    if api_data:
+        title_cost = api_data["cost_usd"]
     else:
-        print("📭 사용 기록 없음")
-        print("-- ~/.claude/projects/ 에 JSONL 파일이 없습니다 | size=11")
+        title_cost = local_cost
+
+    c = color_for_cost(title_cost)
+    print(f"💬 ${title_cost:.2f} | color={c}")
+    print("---")
+
+    now = datetime.now()
+    reset_date = next_month_first().strftime("%-d %b %Y")
+
+    # ╔═══════════════════════════════════════════════════╗
+    # ║  API Monthly Limit — Anthropic 콘솔 실제 청구액   ║
+    # ╚═══════════════════════════════════════════════════╝
+    print("💰 API Monthly Limit | size=14")
+    print("Anthropic Console 실제 청구액 | size=11 color=#888888")
+    if api_data:
+        api_cost = api_data["cost_usd"]
+        c = color_for_cost(api_cost)
+
+        print(f"이번 달: ${api_cost:.2f} | size=13 color={c}")
+        print(f"Resets on {reset_date} | size=11 color=#888888")
+        print(f"---")
+
+        # 모델별 비용
+        for name, usd in sorted(api_data["models"].items(), key=lambda x: -x[1]):
+            if usd >= 0.01:
+                pct = (usd / api_cost * 100) if api_cost > 0 else 0
+                print(f"  {name}: ${usd:.2f} ({pct:.0f}%) | size=11 font=Menlo")
+    else:
+        print(f"⚠️ Admin API Key 미설정 | size=11 color=#FF9800")
+        print(f"--🔑 API Key 등록하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
 
     print("---")
-    print("⚙️ 설정")
-    print(f"--데이터 소스: ~/.claude/projects/ | size=11 color=#888888")
-    print(f"--월 예산: ${budget:.2f} | size=11")
-    print(f"--설정 파일: {CONFIG_PATH} | size=11 color=#888888")
+
+    # ╔═══════════════════════════════════════════════════╗
+    # ║  Claude Code API 사용 추정 — JSONL 기반 추정치    ║
+    # ╚═══════════════════════════════════════════════════╝
+    print("💻 Claude Code API 사용 추정 | size=14")
+    print("로컬 JSONL 기반 API 비용 추정 | size=11 color=#888888")
+
+    c = color_for_cost(local_cost)
+
+    print(f"이번 달: ${local_cost:.2f} | size=13 color={c}")
+    print(f"오늘:    ${today_cost:.2f} | size=12")
+
+    if api_data:
+        # API 실제값과 비교
+        diff = api_data["cost_usd"] - local_cost
+        if abs(diff) > 0.01:
+            print(f"---")
+            if diff > 0:
+                print(f"API 실제 청구액과 차이: +${diff:.2f} (다른 API 사용분 포함) | size=10 color=#888888")
+            else:
+                print(f"API 실제 청구액과 차이: -${abs(diff):.2f} (추정 오차) | size=10 color=#888888")
+
+    if model_details:
+        print(f"---")
+        for model, in_t, out_t, cost, calls in model_details:
+            pct = (cost / local_cost * 100) if local_cost > 0 else 0
+            print(f"  {model} | size=11 font=Menlo")
+            print(f"  -- ${cost:.4f} ({pct:.0f}%) · {calls}회 · In {fmt_tokens(in_t)} Out {fmt_tokens(out_t)} | size=10")
+    else:
+        print(f"📭 이번 달 사용 기록 없음 | size=11")
+
     print("---")
-    print("🔄 새로고침 | refresh=true")
+
+    # ╔═══════════════════════════════════════════════════╗
+    # ║  설정                                             ║
+    # ╚═══════════════════════════════════════════════════╝
+    print("⚙️ 설정")
+    if admin_key:
+        print(f"--🔑 Admin API Key: ✅ 연결됨 | size=11 color=#4CAF50")
+        print(f"--🔑 API Key 변경하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
+    else:
+        print(f"--🔑 Admin API Key: ❌ 미설정 | size=11 color=#F44336")
+        print(f"--🔑 API Key 등록하기 | bash={SCRIPT_PATH} param1=set-api-key terminal=false refresh=true")
+    print(f"--Claude Code 추정: ✅ 자동 (JSONL 스캔) | size=11 color=#4CAF50")
+    print(f"--캐시 가격 보정: write 1.25x, read 0.1x | size=10 color=#888888")
+    print(f"--설정 파일: {CONFIG_PATH} | size=10 color=#888888")
+    print("---")
+
+    print(f"🔄 새로고침 (마지막: {now.strftime('%H:%M')}) | refresh=true")
 
 
 if __name__ == "__main__":

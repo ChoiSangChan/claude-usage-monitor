@@ -102,6 +102,7 @@ def process_transcript(transcript_path: str, session_id: str):
 
     total_input = 0
     total_output = 0
+    total_cost = 0.0
     model_name = "unknown"
     new_entries = 0
 
@@ -128,17 +129,32 @@ def process_transcript(transcript_path: str, session_id: str):
         cache_read = usage.get("cache_read_input_tokens", 0)
         output_t = usage.get("output_tokens", 0)
 
-        # 총 입력 토큰 = input + cache_creation + cache_read
+        # 캐시 토큰은 별도 가격 적용
+        pricing = PRICING.get(model)
+        if not pricing:
+            for known_model, p in PRICING.items():
+                if model.startswith(known_model.rsplit("-", 1)[0]):
+                    pricing = p
+                    break
+        if not pricing:
+            pricing = {"input": 3.00, "output": 15.00}
+
+        msg_cost = (input_t / 1_000_000) * pricing["input"] + \
+                   (cache_create / 1_000_000) * pricing["input"] * 1.25 + \
+                   (cache_read / 1_000_000) * pricing["input"] * 0.1 + \
+                   (output_t / 1_000_000) * pricing["output"]
+
         effective_input = input_t + cache_create + cache_read
         total_input += effective_input
         total_output += output_t
+        total_cost += msg_cost
         new_entries += 1
 
     if new_entries == 0:
         save_offset(transcript_path, len(lines))
         return
 
-    cost = calculate_cost(model_name, total_input, total_output)
+    cost = total_cost
 
     conn = get_db()
     try:

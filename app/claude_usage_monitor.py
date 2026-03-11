@@ -5,10 +5,13 @@ rumps 기반 독립 실행형 메뉴바 앱. 10분마다 사용량을 자동 갱
 """
 
 import sqlite3
+import json
 import os
 import sys
 import threading
-from datetime import datetime
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -22,6 +25,8 @@ except ImportError:
 APP_NAME = "Claude Usage Monitor"
 REFRESH_INTERVAL_SEC = 600  # 10분 (초)
 DB_PATH = Path.home() / ".claude-usage-monitor" / "usage.db"
+CONFIG_PATH = Path.home() / ".claude-usage-monitor" / "config.json"
+API_CACHE_PATH = Path.home() / ".claude-usage-monitor" / "api_cache.json"
 
 # ─────────────────────────────────────────────
 # 35개 모델 가격표 (USD per 1M tokens)
@@ -154,6 +159,101 @@ def format_tokens(n):
     if n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+# ─────────────────────────────────────────────
+# Config & Admin API
+# ─────────────────────────────────────────────
+def get_app_config():
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def fetch_api_cost_report(admin_api_key):
+    """Anthropic Admin API에서 이번 달 실제 비용을 조회."""
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    ending = now + timedelta(days=1)
+
+    url = (
+        f"https://api.anthropic.com/v1/organizations/cost_report?"
+        f"starting_at={month_start.strftime('%Y-%m-%dT00:00:00Z')}&"
+        f"ending_at={ending.strftime('%Y-%m-%dT00:00:00Z')}&"
+        f"bucket_width=1d&"
+        f"group_by[]=description"
+    )
+
+    req = urllib.request.Request(url, headers={
+        "anthropic-version": "2023-06-01",
+        "x-api-key": admin_api_key,
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        return data
+    except Exception:
+        return None
+
+
+def get_api_billing_data():
+    """Admin API로 빌링 데이터를 가져오고 캐시."""
+    config = get_app_config()
+    admin_key = config.get("admin_api_key", "")
+    if not admin_key:
+        return None
+
+    # 캐시 확인 (5분 이내면 재사용)
+    if API_CACHE_PATH.exists():
+        try:
+            with open(API_CACHE_PATH) as f:
+                cache = json.load(f)
+            cached_at = datetime.fromisoformat(cache.get("cached_at", ""))
+            if (datetime.now() - cached_at).total_seconds() < 300:
+                return cache.get("data")
+        except Exception:
+            pass
+
+    cost_data = fetch_api_cost_report(admin_key)
+    if not cost_data:
+        return None
+
+    total_cost_cents = 0
+    model_costs = {}
+    for bucket in cost_data.get("data", []):
+        for item in bucket.get("costs", []):
+            amount = float(item.get("amount", "0"))
+            total_cost_cents += amount
+            desc = item.get("description", "Unknown")
+            parsed = item.get("parsed_description", {})
+            model_name = parsed.get("model", desc)
+            if model_name not in model_costs:
+                model_costs[model_name] = 0.0
+            model_costs[model_name] += amount
+
+    total_cost_usd = total_cost_cents / 100.0
+    model_costs_usd = {k: v / 100.0 for k, v in model_costs.items()}
+
+    result = {
+        "total_cost_usd": total_cost_usd,
+        "model_costs_usd": model_costs_usd,
+        "monthly_limit_usd": config.get("api_monthly_limit_usd", 200.0),
+        "credit_balance_usd": config.get("credit_balance_usd"),
+    }
+
+    try:
+        API_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(API_CACHE_PATH, "w") as f:
+            json.dump({"cached_at": datetime.now().isoformat(), "data": result}, f)
+    except Exception:
+        pass
+
+    return result
 
 
 def get_bar_color_name(ratio):
@@ -296,10 +396,20 @@ class ClaudeUsageMonitorApp(_base_class):
         monthly_cost, model_details = get_monthly_usage()
         today_cost = get_today_usage()
         budget = get_monthly_budget()
-        ratio = monthly_cost / budget if budget > 0 else 0
+
+        # Admin API 실제 빌링 데이터 시도
+        api_data = get_api_billing_data()
+        if api_data:
+            display_cost = api_data["total_cost_usd"]
+            display_budget = api_data["monthly_limit_usd"]
+        else:
+            display_cost = monthly_cost
+            display_budget = budget
+
+        ratio = display_cost / display_budget if display_budget > 0 else 0
 
         # 메뉴바 타이틀 업데이트
-        self.title = f"\U0001F4AC ${monthly_cost:.0f}/${budget:.0f}"
+        self.title = f"\U0001F4AC ${display_cost:.0f}/${display_budget:.0f}"
 
         if rumps is None:
             return  # GUI 없는 환경에서는 타이틀만 업데이트

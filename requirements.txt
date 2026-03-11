@@ -1,0 +1,11 @@
+# Claude Usage Monitor - Dependencies
+
+# 메뉴바 앱 (독립 실행형)
+rumps>=0.4.0
+
+# macOS .app 빌드
+py2app>=0.28.0
+
+# API Hook (선택 - 사용하는 API에 따라 설치)
+# anthropic>=0.40.0
+# openai>=1.50.0

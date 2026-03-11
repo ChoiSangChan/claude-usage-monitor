@@ -8,7 +8,7 @@
 # <xbar.dependencies>python3,sqlite3</xbar.dependencies>
 # <xbar.abouturl>https://github.com/claude-usage-monitor</xbar.abouturl>
 #
-# 5분마다 갱신 (파일명의 .5m.)
+# 10분마다 갱신 (파일명의 .10m.)
 
 import sqlite3
 import os

@@ -9,15 +9,27 @@ Claude Code의 Stop 이벤트에서 transcript_path를 읽어
 import json
 import sqlite3
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 DB_DIR = Path.home() / ".claude-usage-monitor"
 DB_PATH = DB_DIR / "usage.db"
+LOG_PATH = DB_DIR / "hook-debug.log"
 SCHEMA_PATH = Path(__file__).parent.parent / "sql" / "schema.sql"
 
 # 마지막으로 처리한 라인 번호를 저장하는 파일
 OFFSET_DIR = DB_DIR / "offsets"
+
+
+def log(msg):
+    """디버그 로그를 파일에 기록."""
+    try:
+        DB_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
 
 # Anthropic 가격표 (USD per 1M tokens)
 PRICING = {
@@ -152,21 +164,49 @@ def process_transcript(transcript_path: str, session_id: str):
 
 
 def main():
+    log("=== Hook 시작 ===")
+
     init_db()
 
     # Claude Code hook은 stdin으로 JSON을 전달
     try:
-        hook_input = json.loads(sys.stdin.read())
-    except (json.JSONDecodeError, Exception):
+        raw_input = sys.stdin.read()
+        log(f"stdin 원본: {raw_input[:500]}")
+        hook_input = json.loads(raw_input)
+    except (json.JSONDecodeError, Exception) as e:
+        log(f"JSON 파싱 실패: {e}")
+        return
+
+    log(f"hook_input 키: {list(hook_input.keys())}")
+
+    # stop_hook_active 체크 (무한루프 방지)
+    if hook_input.get("stop_hook_active"):
+        log("stop_hook_active=True, 스킵")
         return
 
     transcript_path = hook_input.get("transcript_path", "")
     session_id = hook_input.get("session_id", "")
 
+    log(f"transcript_path: {transcript_path}")
+    log(f"session_id: {session_id}")
+
     if not transcript_path:
+        log("transcript_path가 비어있음, 종료")
         return
 
-    process_transcript(transcript_path, session_id)
+    # ~ 경로 확장
+    transcript_path = str(Path(transcript_path).expanduser())
+    log(f"확장된 경로: {transcript_path}")
+
+    if not Path(transcript_path).exists():
+        log(f"파일이 존재하지 않음: {transcript_path}")
+        return
+
+    try:
+        process_transcript(transcript_path, session_id)
+        log("처리 완료!")
+    except Exception as e:
+        log(f"process_transcript 에러: {e}\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":

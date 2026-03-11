@@ -24,10 +24,9 @@ NC='\033[0m'
 # 설정
 REPO_URL="https://github.com/ChoiSangChan/claude-usage-monitor.git"
 INSTALL_DIR="$HOME/claude-usage-monitor"
-DB_DIR="$HOME/.claude-usage-monitor"
-DB_PATH="$DB_DIR/usage.db"
+CONFIG_DIR="$HOME/.claude-usage-monitor"
+CONFIG_PATH="$CONFIG_DIR/config.json"
 XBAR_PLUGIN_DIR="$HOME/Library/Application Support/xbar/plugins"
-CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 
 clear
 echo ""
@@ -35,14 +34,14 @@ echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════════════════╗"
 echo "  ║                                                      ║"
 echo "  ║   💬 Claude Usage Monitor                            ║"
-echo "  ║   원클릭 설치 프로그램 v2.0                            ║"
+echo "  ║   원클릭 설치 프로그램 v3.0                            ║"
 echo "  ║                                                      ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo ""
 echo -e "  이 프로그램은 다음을 자동으로 설치합니다:"
 echo ""
-echo -e "    ${GREEN}✦${NC} Claude Code Stop Hook (자동 사용량 추적)"
+echo -e "    ${GREEN}✦${NC} ~/.claude/projects/ JSONL 파일에서 사용량 자동 집계"
 echo -e "    ${GREEN}✦${NC} macOS 메뉴바에 사용량 & 예산 실시간 표시"
 echo -e "    ${GREEN}✦${NC} 10분마다 자동 갱신"
 echo ""
@@ -54,7 +53,7 @@ read -r
 # ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [1/6] 시스템 확인${NC}"
+echo -e "${CYAN}  [1/4] 시스템 확인${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -67,46 +66,27 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 echo -e "${GREEN}  ✔ macOS $(sw_vers -productVersion) 확인${NC}"
 
-# ─────────────────────────────────────────────────────
-# Step 2: Python 확인
-# ─────────────────────────────────────────────────────
-echo ""
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [2/6] Python 확인${NC}"
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
 if ! command -v python3 &> /dev/null; then
     echo -e "${YELLOW}  ⚠ Python3가 설치되어 있지 않습니다.${NC}"
-    echo ""
-    echo "  자동으로 설치를 시도합니다..."
-
     if command -v brew &> /dev/null; then
         brew install python3
     else
-        echo -e "${RED}  ✖ Homebrew도 설치되어 있지 않습니다.${NC}"
-        echo ""
-        echo "  다음 중 하나를 먼저 설치해주세요:"
-        echo "    1. https://www.python.org/downloads/ 에서 Python 다운로드"
-        echo "    2. 또는 터미널에서:"
-        echo '       /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-        echo "       brew install python3"
-        echo ""
-        echo "  설치 후 이 파일을 다시 실행해주세요."
+        echo -e "${RED}  ✖ Python3과 Homebrew가 없습니다.${NC}"
+        echo "  https://www.python.org/downloads/ 에서 Python을 먼저 설치해주세요."
         echo "  아무 키나 누르면 종료합니다."
         read -n 1
         exit 1
     fi
 fi
-
 PYTHON_VERSION=$(python3 --version 2>&1)
 echo -e "${GREEN}  ✔ $PYTHON_VERSION${NC}"
 
 # ─────────────────────────────────────────────────────
-# Step 3: 프로젝트 다운로드
+# Step 2: 프로젝트 다운로드
 # ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [3/6] 프로젝트 다운로드${NC}"
+echo -e "${CYAN}  [2/4] 프로젝트 다운로드${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 if [ -d "$INSTALL_DIR" ]; then
@@ -134,107 +114,34 @@ fi
 cd "$INSTALL_DIR"
 
 # ─────────────────────────────────────────────────────
-# Step 4: 데이터베이스 설정
+# Step 3: 설정 파일 생성
 # ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [4/6] 데이터베이스 설정${NC}"
+echo -e "${CYAN}  [3/4] 설정${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-mkdir -p "$DB_DIR"
+mkdir -p "$CONFIG_DIR"
 
-if [ -f "$DB_PATH" ]; then
-    echo -e "${GREEN}  ✔ 기존 데이터베이스 유지: $DB_PATH${NC}"
-    sqlite3 "$DB_PATH" < "$INSTALL_DIR/sql/schema.sql" 2>/dev/null || true
+if [ -f "$CONFIG_PATH" ]; then
+    echo -e "${GREEN}  ✔ 기존 설정 유지: $CONFIG_PATH${NC}"
 else
-    sqlite3 "$DB_PATH" < "$INSTALL_DIR/sql/schema.sql"
-    echo -e "${GREEN}  ✔ 데이터베이스 생성 완료${NC}"
-fi
-
-# ─────────────────────────────────────────────────────
-# Step 5: Claude Code Hook 설정
-# ─────────────────────────────────────────────────────
-echo ""
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [5/6] Claude Code Hook 설정${NC}"
-echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-chmod +x "$INSTALL_DIR/scripts/claude-code-hook.py"
-
-# Claude Code settings.json에 Stop hook 추가
-mkdir -p "$HOME/.claude"
-
-if [ -f "$CLAUDE_SETTINGS" ]; then
-    # 기존 설정 파일이 있으면 hook 추가
-    if python3 -c "
-import json, sys
-
-with open('$CLAUDE_SETTINGS') as f:
-    settings = json.load(f)
-
-hooks = settings.setdefault('hooks', {})
-stop_hooks = hooks.setdefault('Stop', [])
-
-# 이미 claude-usage-monitor hook이 있는지 확인
-hook_cmd = 'python3 $INSTALL_DIR/scripts/claude-code-hook.py'
-already_exists = False
-for entry in stop_hooks:
-    for h in entry.get('hooks', []):
-        if 'claude-code-hook' in h.get('command', ''):
-            already_exists = True
-            break
-
-if not already_exists:
-    stop_hooks.append({
-        'matcher': '',
-        'hooks': [{
-            'type': 'command',
-            'command': hook_cmd
-        }]
-    })
-
-with open('$CLAUDE_SETTINGS', 'w') as f:
-    json.dump(settings, f, indent=4)
-
-if already_exists:
-    print('EXISTS')
-else:
-    print('ADDED')
-" 2>/dev/null; then
-        echo -e "${GREEN}  ✔ Claude Code Stop Hook 설정 완료${NC}"
-    else
-        echo -e "${YELLOW}  ⚠ 설정 파일 수정 실패. 수동으로 추가해주세요.${NC}"
-    fi
-else
-    # 새로 생성
-    cat > "$CLAUDE_SETTINGS" << JSONEOF
+    cat > "$CONFIG_PATH" << 'JSONEOF'
 {
-    "hooks": {
-        "Stop": [
-            {
-                "matcher": "",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "python3 $INSTALL_DIR/scripts/claude-code-hook.py"
-                    }
-                ]
-            }
-        ]
-    }
+    "monthly_budget_usd": 100.0
 }
 JSONEOF
-    echo -e "${GREEN}  ✔ Claude Code Hook 설정 생성 완료${NC}"
+    echo -e "${GREEN}  ✔ 설정 파일 생성: $CONFIG_PATH${NC}"
 fi
 
-echo -e "     Claude Code 세션이 끝날 때마다 자동으로 사용량이 기록됩니다."
+echo -e "     월 예산을 변경하려면: $CONFIG_PATH 를 편집하세요"
 
 # ─────────────────────────────────────────────────────
-# Step 6: xbar 메뉴바 플러그인
+# Step 4: xbar 메뉴바 플러그인
 # ─────────────────────────────────────────────────────
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${CYAN}  [6/6] 메뉴바 플러그인 설정${NC}"
+echo -e "${CYAN}  [4/4] 메뉴바 플러그인 설정${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 MENUBAR_SRC="$INSTALL_DIR/menubar/claude-usage-monitor.10m.py"
@@ -245,8 +152,7 @@ if [ -d "$XBAR_PLUGIN_DIR" ]; then
     rm -f "$XBAR_PLUGIN_DIR/claude-usage-monitor.5m.py" 2>/dev/null
     cp "$MENUBAR_SRC" "$XBAR_PLUGIN_DIR/"
     chmod +x "$XBAR_PLUGIN_DIR/claude-usage-monitor.10m.py"
-    echo -e "${GREEN}  ✔ xbar 플러그인 설치 완료 (하나만 표시됨)${NC}"
-    echo -e "     10분마다 자동으로 사용량이 갱신됩니다."
+    echo -e "${GREEN}  ✔ xbar 플러그인 설치 완료${NC}"
 else
     echo -e "${YELLOW}  ⚠ xbar가 아직 설치되지 않았습니다.${NC}"
     echo ""
@@ -269,18 +175,14 @@ echo "  ║                                                      ║"
 echo "  ╚══════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 echo ""
-echo -e "  ${BOLD}설치 정보:${NC}"
-echo -e "    📂 프로젝트:    $INSTALL_DIR"
-echo -e "    💾 데이터베이스: $DB_PATH"
-echo -e "    🔗 Hook:       Claude Code Stop Hook (자동 설정됨)"
-echo ""
 echo -e "  ${BOLD}작동 방식:${NC}"
-echo -e "    ${CYAN}1.${NC} Claude Code를 사용하면 세션 종료 시 자동으로 토큰 사용량 기록"
-echo -e "    ${CYAN}2.${NC} xbar 메뉴바에서 실시간 비용 확인 (💬 \$0.00/200)"
-echo -e "    ${CYAN}3.${NC} 10분마다 자동 갱신"
+echo -e "    ${CYAN}✦${NC} ~/.claude/projects/ 의 JSONL transcript 파일을 직접 읽어"
+echo -e "      Claude Code 사용량을 자동 집계합니다."
+echo -e "    ${CYAN}✦${NC} Hook이나 API 키 없이 동작합니다."
+echo -e "    ${CYAN}✦${NC} 10분마다 xbar 메뉴바에서 자동 갱신됩니다."
 echo ""
 echo -e "  ${BOLD}참고:${NC}"
-echo -e "    xbar가 이미 실행 중이면 메뉴바의 xbar 아이콘 > Refresh All을 클릭하세요."
+echo -e "    xbar가 실행 중이면 메뉴바의 xbar 아이콘 > Refresh All을 클릭하세요."
 echo ""
 echo -e "  ${YELLOW}아무 키나 누르면 이 창이 닫힙니다.${NC}"
 read -n 1
